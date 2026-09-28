@@ -6,16 +6,24 @@ const CORS_HEADERS = {
 
 export default {
   async fetch(request, env) {
-    // 1. Handle Preflight OPTIONS Request (Prevents CORS errors)
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
     const url = new URL(request.url);
 
-    // 2. Upload Route
     if (url.pathname === '/upload' && request.method === 'POST') {
       try {
+        if (!env.B2_APPLICATION_KEY || !env.B2_KEY_ID || !env.B2_BUCKET_NAME) {
+          return new Response(
+            JSON.stringify({
+              error: 'Missing Cloudflare Worker Variables!',
+              details: 'B2_APPLICATION_KEY, B2_KEY_ID, ya B2_BUCKET_NAME missing hain.',
+            }),
+            { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
+          );
+        }
+
         const formData = await request.formData();
         const file = formData.get('file');
 
@@ -29,45 +37,76 @@ export default {
         const rawFileName = file.name || `file-${Date.now()}`;
         const cleanFileName = `${Date.now()}-${rawFileName.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
         const fileData = await file.arrayBuffer();
-
-        const b2Host = `${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}`;
-        const b2Url = `https://${b2Host}/${cleanFileName}`;
-        const dateStr = new Date().toUTCString();
         const contentType = file.type || 'application/octet-stream';
 
-        // Signature generate kar rahe hain
-        const authHeader = await getS3AuthHeader(
-          env,
-          'PUT',
-          `/${cleanFileName}`,
-          contentType,
-          dateStr
-        );
+        // Step 1: Authorize with B2 Native API
+        const authCredentials = btoa(`${env.B2_KEY_ID}:${env.B2_APPLICATION_KEY}`);
+        const authRes = await fetch('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
+          headers: { Authorization: `Basic ${authCredentials}` },
+        });
 
-        // B2 me upload stream
-        const b2Response = await fetch(b2Url, {
-          method: 'PUT',
+        if (!authRes.ok) {
+          const authErr = await authRes.text();
+          throw new Error(`B2 Authorization Failed: ${authErr}`);
+        }
+
+        const authData = await authRes.json();
+        const apiUrl = authData.apiUrl;
+        const accountAuthToken = authData.authorizationToken;
+        const downloadUrl = authData.downloadUrl;
+
+        // Step 2: Get Bucket ID
+        const bucketsRes = await fetch(`${apiUrl}/b2api/v2/b2_list_buckets`, {
+          method: 'POST',
+          headers: { Authorization: accountAuthToken },
+          body: JSON.stringify({ accountId: authData.accountId }),
+        });
+
+        const bucketsData = await bucketsRes.json();
+        const targetBucket = bucketsData.buckets.find(b => b.bucketName === env.B2_BUCKET_NAME);
+
+        if (!targetBucket) {
+          throw new Error(`Bucket '${env.B2_BUCKET_NAME}' not found in B2 account.`);
+        }
+
+        // Step 3: Get Upload URL
+        const uploadUrlRes = await fetch(`${apiUrl}/b2api/v2/b2_get_upload_url`, {
+          method: 'POST',
+          headers: { Authorization: accountAuthToken },
+          body: JSON.stringify({ bucketId: targetBucket.bucketId }),
+        });
+
+        const uploadUrlData = await uploadUrlRes.json();
+
+        // Step 4: Calculate SHA-1 Hash of the file
+        const hashBuffer = await crypto.subtle.digest('SHA-1', fileData);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const sha1Hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+        // Step 5: Upload File to B2
+        const uploadRes = await fetch(uploadUrlData.uploadUrl, {
+          method: 'POST',
           headers: {
+            Authorization: uploadUrlData.authorizationToken,
+            'X-Bz-File-Name': encodeURIComponent(cleanFileName),
             'Content-Type': contentType,
-            'Host': b2Host,
-            'Authorization': authHeader,
-            'x-amz-date': dateStr,
+            'X-Bz-Content-Sha1': sha1Hash,
           },
           body: fileData,
         });
 
-        if (!b2Response.ok) {
-          const errText = await b2Response.text();
-          return new Response(JSON.stringify({ error: 'B2 Upload Failed', details: errText }), {
-            status: 500,
-            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-          });
+        if (!uploadRes.ok) {
+          const uploadErr = await uploadRes.text();
+          throw new Error(`B2 File Upload Failed: ${uploadErr}`);
         }
+
+        const finalFileUrl = `${downloadUrl}/file/${env.B2_BUCKET_NAME}/${cleanFileName}`;
 
         return new Response(
           JSON.stringify({
             success: true,
             file_name: cleanFileName,
+            file_url: finalFileUrl,
           }),
           {
             status: 200,
@@ -75,26 +114,14 @@ export default {
           }
         );
       } catch (err) {
-        return new Response(JSON.stringify({ error: err.message }), {
-          status: 500,
-          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-        });
+        return new Response(
+          JSON.stringify({ error: 'Worker Error (500)', details: err.message }),
+          {
+            status: 500,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          }
+        );
       }
-    }
-
-    // 3. File Stream Route (Assets stream karne ke liye)
-    const fileName = url.searchParams.get('file');
-    if (fileName) {
-      const b2FileUrl = `https://${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}/${encodeURIComponent(fileName)}`;
-      const b2File = await fetch(b2FileUrl);
-
-      if (!b2File.ok) {
-        return new Response('File not found', { status: 404, headers: CORS_HEADERS });
-      }
-
-      const response = new Response(b2File.body, b2File);
-      Object.keys(CORS_HEADERS).forEach(key => response.headers.set(key, CORS_HEADERS[key]));
-      return response;
     }
 
     return new Response(JSON.stringify({ error: 'Invalid Endpoint' }), {
@@ -103,22 +130,3 @@ export default {
     });
   },
 };
-
-// S3 HMAC Signature Helper
-async function getS3AuthHeader(env, method, path, contentType, dateStr) {
-  const stringToSign = `${method}\n\n${contentType}\n${dateStr}\n/${env.B2_BUCKET_NAME}${path}`;
-  const encoder = new TextEncoder();
-
-  const key = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(env.B2_APPLICATION_KEY),
-    { name: 'HMAC', hash: 'SHA-1' },
-    false,
-    ['sign']
-  );
-
-  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(stringToSign));
-  const base64Sig = btoa(String.fromCharCode(...new Uint8Array(signature)));
-
-  return `AWS ${env.B2_KEY_ID}:${base64Sig}`;
-}
