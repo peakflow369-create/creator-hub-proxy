@@ -1,3 +1,10 @@
 name = "creator-hub-proxy"
 main = "index.js"
 compatibility_date = "2026-09-28"
+# ...
+[previews.vars]
+B2_APPLICATION_KEY = "K005Na/cj49UgQiIAskInq6GEJ6ogUA"
+B2_BUCKET_NAME = "creator-hub-assets-2026"
+B2_ENDPOINT = "s3.us-west-004.backblazeb2.com"
+B2_KEY_ID = "0057947ab7c39cc0000000001"
+# ...
