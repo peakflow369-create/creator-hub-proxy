@@ -140,43 +140,12 @@ export default {
       }
     }
 
-    // 2. DOWNLOAD / STREAM FILE ENDPOINT
+    // 2. DOWNLOAD ENDPOINT (Direct B2 Redirect)
     const fileName = url.searchParams.get('file') || url.pathname.split('/').pop();
 
     if (fileName && fileName !== '' && fileName !== '/') {
-      try {
-        // Fetch direct from B2 Bucket URL
-        const b2Endpoint = env.B2_ENDPOINT || 's3.us-west-004.backblazeb2.com';
-        const filePublicUrl = `https://${env.B2_BUCKET_NAME}.${b2Endpoint}/${encodeURIComponent(fileName)}`;
-        
-        const b2File = await fetch(filePublicUrl);
-
-        if (!b2File.ok) {
-          // Fallback to Native B2 Download URL structure
-          const fallbackUrl = `https://f004.backblazeb2.com/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
-          const fallbackFile = await fetch(fallbackUrl);
-
-          if (!fallbackFile.ok) {
-            return new Response(JSON.stringify({ error: 'File Not Found on B2 Storage' }), {
-              status: 404,
-              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-            });
-          }
-
-          const res = new Response(fallbackFile.body, fallbackFile);
-          Object.keys(CORS_HEADERS).forEach(k => res.headers.set(k, CORS_HEADERS[k]));
-          return res;
-        }
-
-        const response = new Response(b2File.body, b2File);
-        Object.keys(CORS_HEADERS).forEach(k => response.headers.set(k, CORS_HEADERS[k]));
-        return response;
-      } catch (e) {
-        return new Response(JSON.stringify({ error: 'Download proxy failed', details: e.message }), {
-          status: 500,
-          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-        });
-      }
+      const b2DirectUrl = `https://f004.backblazeb2.com/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
+      return Response.redirect(b2DirectUrl, 302);
     }
 
     return new Response(JSON.stringify({ error: 'Invalid Endpoint' }), {
