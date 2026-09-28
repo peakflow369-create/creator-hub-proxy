@@ -39,7 +39,7 @@ export default {
         const fileData = await file.arrayBuffer();
         const contentType = file.type || 'application/octet-stream';
 
-        // Step 1: Authorize with B2 Native API
+        // Step 1: Authorize
         const authCredentials = btoa(`${env.B2_KEY_ID}:${env.B2_APPLICATION_KEY}`);
         const authRes = await fetch('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
           headers: { Authorization: `Basic ${authCredentials}` },
@@ -55,35 +55,50 @@ export default {
         const accountAuthToken = authData.authorizationToken;
         const downloadUrl = authData.downloadUrl;
 
-        // Step 2: Get Bucket ID
-        const bucketsRes = await fetch(`${apiUrl}/b2api/v2/b2_list_buckets`, {
-          method: 'POST',
-          headers: { Authorization: accountAuthToken },
-          body: JSON.stringify({ accountId: authData.accountId }),
-        });
+        // Bucket ID extract (direct authorized bucket ID or fallback search)
+        let bucketId = authData.allowed?.bucketId;
 
-        const bucketsData = await bucketsRes.json();
-        const targetBucket = bucketsData.buckets.find(b => b.bucketName === env.B2_BUCKET_NAME);
+        if (!bucketId) {
+          const bucketsRes = await fetch(`${apiUrl}/b2api/v2/b2_list_buckets`, {
+            method: 'POST',
+            headers: { Authorization: accountAuthToken },
+            body: JSON.stringify({ accountId: authData.accountId }),
+          });
 
-        if (!targetBucket) {
-          throw new Error(`Bucket '${env.B2_BUCKET_NAME}' not found in B2 account.`);
+          if (!bucketsRes.ok) {
+            const bErr = await bucketsRes.text();
+            throw new Error(`Failed to list buckets: ${bErr}. Check if your Application Key has access to list buckets.`);
+          }
+
+          const bucketsData = await bucketsRes.json();
+          const targetBucket = bucketsData.buckets?.find(b => b.bucketName === env.B2_BUCKET_NAME);
+
+          if (!targetBucket) {
+            throw new Error(`Bucket '${env.B2_BUCKET_NAME}' not found.`);
+          }
+          bucketId = targetBucket.bucketId;
         }
 
-        // Step 3: Get Upload URL
+        // Step 2: Get Upload URL
         const uploadUrlRes = await fetch(`${apiUrl}/b2api/v2/b2_get_upload_url`, {
           method: 'POST',
           headers: { Authorization: accountAuthToken },
-          body: JSON.stringify({ bucketId: targetBucket.bucketId }),
+          body: JSON.stringify({ bucketId: bucketId }),
         });
+
+        if (!uploadUrlRes.ok) {
+          const uErr = await uploadUrlRes.text();
+          throw new Error(`Get Upload URL Failed: ${uErr}`);
+        }
 
         const uploadUrlData = await uploadUrlRes.json();
 
-        // Step 4: Calculate SHA-1 Hash of the file
+        // Step 3: SHA-1 Hash
         const hashBuffer = await crypto.subtle.digest('SHA-1', fileData);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         const sha1Hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-        // Step 5: Upload File to B2
+        // Step 4: Upload File
         const uploadRes = await fetch(uploadUrlData.uploadUrl, {
           method: 'POST',
           headers: {
