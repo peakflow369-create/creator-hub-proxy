@@ -12,6 +12,7 @@ export default {
 
     const url = new URL(request.url);
 
+    // 1. UPLOAD ENDPOINT
     if (url.pathname === '/upload' && request.method === 'POST') {
       try {
         if (!env.B2_APPLICATION_KEY || !env.B2_KEY_ID || !env.B2_BUCKET_NAME) {
@@ -39,7 +40,7 @@ export default {
         const fileData = await file.arrayBuffer();
         const contentType = file.type || 'application/octet-stream';
 
-        // Step 1: Authorize
+        // Authorize B2
         const authCredentials = btoa(`${env.B2_KEY_ID}:${env.B2_APPLICATION_KEY}`);
         const authRes = await fetch('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
           headers: { Authorization: `Basic ${authCredentials}` },
@@ -55,7 +56,6 @@ export default {
         const accountAuthToken = authData.authorizationToken;
         const downloadUrl = authData.downloadUrl;
 
-        // Bucket ID extract (direct authorized bucket ID or fallback search)
         let bucketId = authData.allowed?.bucketId;
 
         if (!bucketId) {
@@ -67,7 +67,7 @@ export default {
 
           if (!bucketsRes.ok) {
             const bErr = await bucketsRes.text();
-            throw new Error(`Failed to list buckets: ${bErr}. Check if your Application Key has access to list buckets.`);
+            throw new Error(`Failed to list buckets: ${bErr}`);
           }
 
           const bucketsData = await bucketsRes.json();
@@ -79,7 +79,7 @@ export default {
           bucketId = targetBucket.bucketId;
         }
 
-        // Step 2: Get Upload URL
+        // Get Upload URL
         const uploadUrlRes = await fetch(`${apiUrl}/b2api/v2/b2_get_upload_url`, {
           method: 'POST',
           headers: { Authorization: accountAuthToken },
@@ -93,12 +93,12 @@ export default {
 
         const uploadUrlData = await uploadUrlRes.json();
 
-        // Step 3: SHA-1 Hash
+        // Calculate SHA-1
         const hashBuffer = await crypto.subtle.digest('SHA-1', fileData);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         const sha1Hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-        // Step 4: Upload File
+        // Upload to B2
         const uploadRes = await fetch(uploadUrlData.uploadUrl, {
           method: 'POST',
           headers: {
@@ -122,6 +122,7 @@ export default {
             success: true,
             file_name: cleanFileName,
             file_url: finalFileUrl,
+            download_url: finalFileUrl
           }),
           {
             status: 200,
@@ -136,6 +137,45 @@ export default {
             headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
           }
         );
+      }
+    }
+
+    // 2. DOWNLOAD / STREAM FILE ENDPOINT
+    const fileName = url.searchParams.get('file') || url.pathname.split('/').pop();
+
+    if (fileName && fileName !== '' && fileName !== '/') {
+      try {
+        // Fetch direct from B2 Bucket URL
+        const b2Endpoint = env.B2_ENDPOINT || 's3.us-west-004.backblazeb2.com';
+        const filePublicUrl = `https://${env.B2_BUCKET_NAME}.${b2Endpoint}/${encodeURIComponent(fileName)}`;
+        
+        const b2File = await fetch(filePublicUrl);
+
+        if (!b2File.ok) {
+          // Fallback to Native B2 Download URL structure
+          const fallbackUrl = `https://f004.backblazeb2.com/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
+          const fallbackFile = await fetch(fallbackUrl);
+
+          if (!fallbackFile.ok) {
+            return new Response(JSON.stringify({ error: 'File Not Found on B2 Storage' }), {
+              status: 404,
+              headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+            });
+          }
+
+          const res = new Response(fallbackFile.body, fallbackFile);
+          Object.keys(CORS_HEADERS).forEach(k => res.headers.set(k, CORS_HEADERS[k]));
+          return res;
+        }
+
+        const response = new Response(b2File.body, b2File);
+        Object.keys(CORS_HEADERS).forEach(k => response.headers.set(k, CORS_HEADERS[k]));
+        return response;
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Download proxy failed', details: e.message }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
       }
     }
 
