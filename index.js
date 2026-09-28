@@ -6,7 +6,7 @@ const CORS_HEADERS = {
 
 export default {
   async fetch(request, env) {
-    // 1. Handle Preflight OPTIONS Request (Prevents CORS "Failed to fetch")
+    // 1. Handle Preflight OPTIONS Request (Prevents CORS errors)
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
@@ -26,7 +26,6 @@ export default {
           });
         }
 
-        // Clean filename (spaces aur special chars replace kar diye)
         const rawFileName = file.name || `file-${Date.now()}`;
         const cleanFileName = `${Date.now()}-${rawFileName.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
         const fileData = await file.arrayBuffer();
@@ -36,7 +35,7 @@ export default {
         const dateStr = new Date().toUTCString();
         const contentType = file.type || 'application/octet-stream';
 
-        // S3 Authorization Signature generate karna
+        // Signature generate kar rahe hain
         const authHeader = await getS3AuthHeader(
           env,
           'PUT',
@@ -45,7 +44,7 @@ export default {
           dateStr
         );
 
-        // Backblaze B2 ko file bhejna
+        // B2 me upload stream
         const b2Response = await fetch(b2Url, {
           method: 'PUT',
           headers: {
@@ -59,7 +58,7 @@ export default {
 
         if (!b2Response.ok) {
           const errText = await b2Response.text();
-          return new Response(JSON.stringify({ error: 'B2 Error', details: errText }), {
+          return new Response(JSON.stringify({ error: 'B2 Upload Failed', details: errText }), {
             status: 500,
             headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
           });
@@ -83,7 +82,7 @@ export default {
       }
     }
 
-    // 3. File Stream Route (Asset playing/downloading ke liye)
+    // 3. File Stream Route (Assets stream karne ke liye)
     const fileName = url.searchParams.get('file');
     if (fileName) {
       const b2FileUrl = `https://${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}/${encodeURIComponent(fileName)}`;
@@ -105,7 +104,7 @@ export default {
   },
 };
 
-// Backblaze B2 HMAC Signature Generator Function
+// S3 HMAC Signature Helper
 async function getS3AuthHeader(env, method, path, contentType, dateStr) {
   const stringToSign = `${method}\n\n${contentType}\n${dateStr}\n/${env.B2_BUCKET_NAME}${path}`;
   const encoder = new TextEncoder();
