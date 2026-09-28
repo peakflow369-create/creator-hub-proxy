@@ -115,7 +115,7 @@ export default {
           throw new Error(`B2 File Upload Failed: ${uploadErr}`);
         }
 
-        const finalFileUrl = `${downloadUrl}/file/${env.B2_BUCKET_NAME}/${cleanFileName}`;
+        const finalFileUrl = `${url.origin}/?file=${encodeURIComponent(cleanFileName)}`;
 
         return new Response(
           JSON.stringify({
@@ -140,7 +140,7 @@ export default {
       }
     }
 
-    // 2. DOWNLOAD ENDPOINT
+    // 2. FREE AUTHORIZED DOWNLOAD PROXY (PRIVATE B2 SUPPORT)
     const fileName = url.searchParams.get('file') || url.pathname.split('/').pop();
 
     if (fileName && fileName !== '' && fileName !== '/') {
@@ -150,19 +150,42 @@ export default {
           headers: { Authorization: `Basic ${authCredentials}` },
         });
 
-        if (authRes.ok) {
-          const authData = await authRes.json();
-          // Dynamic Download Link direct from B2 account auth
-          const directDownloadUrl = `${authData.downloadUrl}/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
-          return Response.redirect(directDownloadUrl, 302);
+        if (!authRes.ok) {
+          const errText = await authRes.text();
+          throw new Error(`Auth failed: ${errText}`);
         }
+
+        const authData = await authRes.json();
+        const fileUrl = `${authData.downloadUrl}/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
+
+        // Backblaze Authorization token pass karke private file proxy kar rahe hain
+        const b2Response = await fetch(fileUrl, {
+          headers: {
+            Authorization: authData.authorizationToken
+          }
+        });
+
+        if (!b2Response.ok) {
+          return new Response(JSON.stringify({ error: 'File Not Found or Access Denied' }), {
+            status: b2Response.status,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const responseHeaders = new Headers(b2Response.headers);
+        Object.keys(CORS_HEADERS).forEach(key => responseHeaders.set(key, CORS_HEADERS[key]));
+        responseHeaders.set('Content-Disposition', `attachment; filename="${fileName}"`);
+
+        return new Response(b2Response.body, {
+          status: 200,
+          headers: responseHeaders,
+        });
+
       } catch (e) {
-        // Fallback to S3 endpoint if specified correctly
-        if (env.B2_ENDPOINT) {
-          const cleanEndpoint = env.B2_ENDPOINT.replace('*', '').trim();
-          const s3Url = `https://${env.B2_BUCKET_NAME}.${cleanEndpoint}/${encodeURIComponent(fileName)}`;
-          return Response.redirect(s3Url, 302);
-        }
+        return new Response(JSON.stringify({ error: 'Download failed', details: e.message }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
       }
     }
 
