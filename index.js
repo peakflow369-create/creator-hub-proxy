@@ -74,7 +74,7 @@ export default {
           const targetBucket = bucketsData.buckets?.find(b => b.bucketName === env.B2_BUCKET_NAME);
 
           if (!targetBucket) {
-            throw new Error(`Bucket '${env.B2_BUCKET_NAME}' not found.`);
+            throw new Error(`Bucket '${env.B2_BUCKET_NAME}' not found in B2 account.`);
           }
           bucketId = targetBucket.bucketId;
         }
@@ -93,12 +93,12 @@ export default {
 
         const uploadUrlData = await uploadUrlRes.json();
 
-        // Calculate SHA-1
+        // SHA-1
         const hashBuffer = await crypto.subtle.digest('SHA-1', fileData);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         const sha1Hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-        // Upload to B2
+        // Upload
         const uploadRes = await fetch(uploadUrlData.uploadUrl, {
           method: 'POST',
           headers: {
@@ -140,12 +140,30 @@ export default {
       }
     }
 
-    // 2. DOWNLOAD ENDPOINT (Direct B2 Redirect)
+    // 2. DOWNLOAD ENDPOINT
     const fileName = url.searchParams.get('file') || url.pathname.split('/').pop();
 
     if (fileName && fileName !== '' && fileName !== '/') {
-      const b2DirectUrl = `https://f004.backblazeb2.com/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
-      return Response.redirect(b2DirectUrl, 302);
+      try {
+        const authCredentials = btoa(`${env.B2_KEY_ID}:${env.B2_APPLICATION_KEY}`);
+        const authRes = await fetch('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
+          headers: { Authorization: `Basic ${authCredentials}` },
+        });
+
+        if (authRes.ok) {
+          const authData = await authRes.json();
+          // Dynamic Download Link direct from B2 account auth
+          const directDownloadUrl = `${authData.downloadUrl}/file/${env.B2_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
+          return Response.redirect(directDownloadUrl, 302);
+        }
+      } catch (e) {
+        // Fallback to S3 endpoint if specified correctly
+        if (env.B2_ENDPOINT) {
+          const cleanEndpoint = env.B2_ENDPOINT.replace('*', '').trim();
+          const s3Url = `https://${env.B2_BUCKET_NAME}.${cleanEndpoint}/${encodeURIComponent(fileName)}`;
+          return Response.redirect(s3Url, 302);
+        }
+      }
     }
 
     return new Response(JSON.stringify({ error: 'Invalid Endpoint' }), {
