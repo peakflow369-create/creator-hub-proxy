@@ -1,53 +1,87 @@
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+
 export default {
   async fetch(request, env) {
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    };
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
     const url = new URL(request.url);
-    const fileName = url.searchParams.get("file");
 
+    // ====================================================
+    // ROUTE 1: DIRECT UPLOAD TO BACKBLAZE B2
+    // ====================================================
+    if (request.method === 'POST' && url.pathname === '/upload') {
+      try {
+        const formData = await request.formData();
+        const file = formData.get('file');
+
+        if (!file) {
+          return new Response(JSON.stringify({ error: 'No file provided' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+          });
+        }
+
+        const fileName = file.name;
+        const arrayBuffer = await file.arrayBuffer();
+
+        // AWS S3 Client instance for Backblaze B2 Compatible Endpoint
+        const s3 = new S3Client({
+          region: env.B2_ENDPOINT.split('.')[1] || 'us-west-004',
+          endpoint: `https://${env.B2_ENDPOINT}`,
+          credentials: {
+            accessKeyId: env.B2_KEY_ID,
+            secretAccessKey: env.B2_APPLICATION_KEY,
+          },
+        });
+
+        // Push file buffer to B2 Bucket
+        await s3.send(new PutObjectCommand({
+          Bucket: env.B2_BUCKET_NAME,
+          Key: fileName,
+          Body: new Uint8Array(arrayBuffer),
+          ContentType: file.type || 'application/octet-stream',
+        }));
+
+        return new Response(JSON.stringify({ 
+          success: true, 
+          file_name: fileName 
+        }), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+
+      } catch (err) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    // ====================================================
+    // ROUTE 2: STREAM FILE FROM BACKBLAZE B2 (Proxy Stream)
+    // ====================================================
+    const fileName = url.searchParams.get('file');
     if (!fileName) {
-      return new Response("Missing 'file' parameter in request.", { status: 400 });
+      return new Response('Missing file parameter', { status: 400, headers: corsHeaders });
     }
 
-    const keyID = env.B2_KEY_ID || "0057947ab7c39cc0000000001";
-    const applicationKey = env.B2_APPLICATION_KEY || "K005Na/cj49UgQiIAskInq6GEJ6ogUA";
-    const bucketName = env.B2_BUCKET_NAME || "creator-hub-assets-2026";
+    const fileUrl = `https://${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}/${encodeURIComponent(fileName)}`;
+    const b2File = await fetch(fileUrl);
 
-    try {
-      const credentials = btoa(`${keyID}:${applicationKey}`);
-      const authResponse = await fetch("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", {
-        headers: {
-          "Authorization": `Basic ${credentials}`
-        }
-      });
-
-      if (!authResponse.ok) {
-        const errorText = await authResponse.text();
-        return new Response(`Backblaze Auth Error (${authResponse.status}): ${errorText}`, { status: 500 });
-      }
-
-      const authData = await authResponse.json();
-      const downloadUrl = authData.downloadUrl;
-      const authToken = authData.authorizationToken;
-
-      const fileUrl = `${downloadUrl}/file/${bucketName}/${encodeURIComponent(fileName)}`;
-      const fileResponse = await fetch(fileUrl, {
-        headers: {
-          "Authorization": authToken
-        }
-      });
-
-      if (!fileResponse.ok) {
-        return new Response(`File not found or access denied (${fileResponse.status})`, { status: fileResponse.status });
-      }
-
-      return new Response(fileResponse.body, {
-        headers: {
-          "Content-Type": "audio/mpeg",
-          "Content-Disposition": `inline; filename="${fileName}"`,
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-    } catch (err) {
-      return new Response("Worker Proxy Error: " + err.message, { status: 500 });
+    if (!b2File.ok) {
+      return new Response('File not found or access denied (404)', { status: 404, headers: corsHeaders });
     }
+
+    const response = new Response(b2File.body, b2File);
+    Object.keys(corsHeaders).forEach(key => response.headers.set(key, corsHeaders[key]));
+    return response;
   }
 };
