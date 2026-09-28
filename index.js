@@ -1,72 +1,74 @@
-// Clean Cloudflare Worker for Backblaze B2 Direct Stream Uploads
-// Pure JavaScript (No external SDK dependencies required)
-
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-File-Name',
+  'Access-Control-Allow-Headers': '*',
 };
 
 export default {
   async fetch(request, env) {
+    // 1. Handle Preflight OPTIONS Request (Prevents CORS "Failed to fetch")
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
     const url = new URL(request.url);
 
-    // Health check endpoint
-    if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', time: new Date().toISOString() }), {
-        status: 200,
-        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
-      });
-    }
-
-    // Upload endpoint
+    // 2. Upload Route
     if (url.pathname === '/upload' && request.method === 'POST') {
       try {
-        const fileName = request.headers.get('X-File-Name') || `upload-${Date.now()}`;
-        const contentType = request.headers.get('Content-Type') || 'application/octet-stream';
-        const fileData = await request.arrayBuffer();
+        const formData = await request.formData();
+        const file = formData.get('file');
 
-        if (!fileData || fileData.byteLength === 0) {
-          return new Response(JSON.stringify({ error: 'Empty file payload' }), {
+        if (!file) {
+          return new Response(JSON.stringify({ error: 'No file provided' }), {
             status: 400,
             headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
           });
         }
 
-        // Upload to Backblaze B2 using S3 API
-        const b2Url = `https://${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}/${encodeURIComponent(fileName)}`;
-        const dateStr = new Date().toUTCString();
+        // Clean filename (spaces aur special chars replace kar diye)
+        const rawFileName = file.name || `file-${Date.now()}`;
+        const cleanFileName = `${Date.now()}-${rawFileName.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
+        const fileData = await file.arrayBuffer();
 
-        const s3Response = await fetch(b2Url, {
+        const b2Host = `${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}`;
+        const b2Url = `https://${b2Host}/${cleanFileName}`;
+        const dateStr = new Date().toUTCString();
+        const contentType = file.type || 'application/octet-stream';
+
+        // S3 Authorization Signature generate karna
+        const authHeader = await getS3AuthHeader(
+          env,
+          'PUT',
+          `/${cleanFileName}`,
+          contentType,
+          dateStr
+        );
+
+        // Backblaze B2 ko file bhejna
+        const b2Response = await fetch(b2Url, {
           method: 'PUT',
           headers: {
             'Content-Type': contentType,
-            'Host': `${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}`,
-            'Authorization': await getS3AuthHeader(env, 'PUT', `/${fileName}`, contentType, dateStr),
+            'Host': b2Host,
+            'Authorization': authHeader,
             'x-amz-date': dateStr,
           },
           body: fileData,
         });
 
-        if (!s3Response.ok) {
-          const errText = await s3Response.text();
-          return new Response(JSON.stringify({ error: 'B2 Upload Failed', details: errText }), {
+        if (!b2Response.ok) {
+          const errText = await b2Response.text();
+          return new Response(JSON.stringify({ error: 'B2 Error', details: errText }), {
             status: 500,
             headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
           });
         }
 
-        const publicUrl = `https://${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}/${fileName}`;
-
         return new Response(
           JSON.stringify({
             success: true,
-            fileName: fileName,
-            url: publicUrl,
+            file_name: cleanFileName,
           }),
           {
             status: 200,
@@ -81,18 +83,33 @@ export default {
       }
     }
 
-    return new Response(JSON.stringify({ error: 'Not Found' }), {
+    // 3. File Stream Route (Asset playing/downloading ke liye)
+    const fileName = url.searchParams.get('file');
+    if (fileName) {
+      const b2FileUrl = `https://${env.B2_BUCKET_NAME}.${env.B2_ENDPOINT}/${encodeURIComponent(fileName)}`;
+      const b2File = await fetch(b2FileUrl);
+
+      if (!b2File.ok) {
+        return new Response('File not found', { status: 404, headers: CORS_HEADERS });
+      }
+
+      const response = new Response(b2File.body, b2File);
+      Object.keys(CORS_HEADERS).forEach(key => response.headers.set(key, CORS_HEADERS[key]));
+      return response;
+    }
+
+    return new Response(JSON.stringify({ error: 'Invalid Endpoint' }), {
       status: 404,
       headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     });
   },
 };
 
-// Helper function to generate S3 HMAC Signature
+// Backblaze B2 HMAC Signature Generator Function
 async function getS3AuthHeader(env, method, path, contentType, dateStr) {
   const stringToSign = `${method}\n\n${contentType}\n${dateStr}\n/${env.B2_BUCKET_NAME}${path}`;
   const encoder = new TextEncoder();
-  
+
   const key = await crypto.subtle.importKey(
     'raw',
     encoder.encode(env.B2_APPLICATION_KEY),
