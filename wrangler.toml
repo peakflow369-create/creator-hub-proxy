@@ -1,0 +1,3 @@
+name = "creator-hub-proxy"
+main = "index.js"
+compatibility_date = "2026-09-28"
